@@ -140,12 +140,13 @@ impl ComdirectClient {
     }
 
     pub async fn primary_token(&self, creds: &ComdirectCredentials) -> Result<TokenResponse> {
-        let mut params = Vec::new();
-        params.push(("client_id", creds.client_id.as_str()));
-        params.push(("client_secret", creds.client_secret.as_str()));
-        params.push(("grant_type", "password"));
-        params.push(("username", creds.username.as_str()));
-        params.push(("password", creds.pin.as_str()));
+        let params = vec![
+            ("client_id", creds.client_id.as_str()),
+            ("client_secret", creds.client_secret.as_str()),
+            ("grant_type", "password"),
+            ("username", creds.username.as_str()),
+            ("password", creds.pin.as_str()),
+        ];
 
         let response = self
             .http
@@ -158,10 +159,10 @@ impl ComdirectClient {
             .context("failed to request primary token")?
             .error_for_status()
             .context("primary token request failed")?;
-        Ok(response
+        response
             .json()
             .await
-            .context("invalid primary token response")?)
+            .context("invalid primary token response")
     }
 
     pub async fn secondary_token(
@@ -169,11 +170,12 @@ impl ComdirectClient {
         creds: &ComdirectCredentials,
         primary_access_token: &str,
     ) -> Result<TokenResponse> {
-        let mut params = Vec::new();
-        params.push(("client_id", creds.client_id.as_str()));
-        params.push(("client_secret", creds.client_secret.as_str()));
-        params.push(("grant_type", "cd_secondary"));
-        params.push(("token", primary_access_token));
+        let params = vec![
+            ("client_id", creds.client_id.as_str()),
+            ("client_secret", creds.client_secret.as_str()),
+            ("grant_type", "cd_secondary"),
+            ("token", primary_access_token),
+        ];
 
         let response = self
             .http
@@ -186,10 +188,10 @@ impl ComdirectClient {
             .context("failed to request secondary token")?
             .error_for_status()
             .context("secondary token request failed")?;
-        Ok(response
+        response
             .json()
             .await
-            .context("invalid secondary token response")?)
+            .context("invalid secondary token response")
     }
 
     pub async fn session_status(&self, user_id: &str, access_token: &str) -> Result<Session> {
@@ -296,10 +298,7 @@ impl ComdirectClient {
             .context("failed to activate session")?
             .error_for_status()
             .context("session activation failed")?;
-        Ok(response
-            .json()
-            .await
-            .context("invalid activation response")?)
+        response.json().await.context("invalid activation response")
     }
 
     pub async fn list_accounts(&self, user_id: &str, access_token: &str) -> Result<Vec<Account>> {
@@ -370,10 +369,10 @@ impl ComdirectClient {
             .await
             .context("failed to list transactions")?;
         let response = error_for_status_with_body(response, "transaction request failed").await?;
-        Ok(response
+        response
             .json()
             .await
-            .context("invalid transactions response")?)
+            .context("invalid transactions response")
     }
 
     fn api_headers(&self, access_token: &str) -> Result<HeaderMap> {
@@ -438,5 +437,24 @@ pub fn format_challenge(challenge: &TanChallenge) -> String {
         format!("TAN type: {}", challenge.tan_type)
     } else {
         format!("TAN type: {} ({})", challenge.tan_type, details.join("; "))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn format_challenge_includes_details() {
+        let challenge = TanChallenge {
+            id: "123".to_string(),
+            tan_type: "M_TAN".to_string(),
+            challenge: Some("+49-123".to_string()),
+            available_types: Some(vec!["M_TAN".to_string()]),
+        };
+        let formatted = format_challenge(&challenge);
+        assert!(formatted.contains("TAN type: M_TAN"));
+        assert!(formatted.contains("challenge: +49-123"));
+        assert!(formatted.contains("available: M_TAN"));
     }
 }

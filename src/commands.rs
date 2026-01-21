@@ -446,8 +446,7 @@ fn build_reference_key(tx: &AccountTransaction, date: NaiveDate, amount_milli: i
         .remittance_info
         .as_deref()
         .unwrap_or("")
-        .replace('\n', " ")
-        .replace('\r', " ");
+        .replace(['\n', '\r'], " ");
     format!("{}|{}|{}", date, amount_milli, memo)
 }
 
@@ -545,5 +544,114 @@ impl From<&AccountSummary> for DisplayAccount {
 impl fmt::Display for DisplayAccount {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{} ({})", self.name, self.id)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::comdirect::{AccountInformation, AmountValue, EnumText};
+
+    fn sample_transaction(
+        reference: Option<&str>,
+        remittance: Option<&str>,
+        tx_type: Option<&str>,
+    ) -> AccountTransaction {
+        AccountTransaction {
+            reference: reference.map(|value| value.to_string()),
+            booking_status: None,
+            booking_date: None,
+            amount: AmountValue {
+                value: "0".to_string(),
+                unit: None,
+            },
+            creditor: None,
+            debtor: None,
+            deptor: None,
+            remitter: None,
+            remittance_info: remittance.map(|value| value.to_string()),
+            transaction_type: tx_type.map(|value| EnumText {
+                key: None,
+                text: Some(value.to_string()),
+            }),
+        }
+    }
+
+    #[test]
+    fn amount_to_milli_handles_sign_and_scale() {
+        assert_eq!(amount_to_milli("12.345").unwrap(), 12_345);
+        assert_eq!(amount_to_milli("-10.10").unwrap(), -10_100);
+    }
+
+    #[test]
+    fn build_reference_key_prefers_reference() {
+        let tx = sample_transaction(Some(" ref-123 "), None, None);
+        let date = NaiveDate::from_ymd_opt(2026, 1, 21).unwrap();
+        let key = build_reference_key(&tx, date, 1000);
+        assert_eq!(key, "ref-123");
+    }
+
+    #[test]
+    fn build_reference_key_uses_memo_when_missing_reference() {
+        let tx = sample_transaction(None, Some("hello\nworld"), None);
+        let date = NaiveDate::from_ymd_opt(2026, 1, 21).unwrap();
+        let key = build_reference_key(&tx, date, 1000);
+        assert_eq!(key, "2026-01-21|1000|hello world");
+    }
+
+    #[test]
+    fn build_memo_combines_remittance_and_type() {
+        let tx = sample_transaction(None, Some("Rent"), Some("Transfer"));
+        let memo = build_memo(&tx).unwrap();
+        assert_eq!(memo, "Rent | Transfer");
+    }
+
+    #[test]
+    fn build_memo_handles_missing_parts() {
+        let tx = sample_transaction(None, None, Some("Transfer"));
+        let memo = build_memo(&tx).unwrap();
+        assert_eq!(memo, "Transfer");
+    }
+
+    #[test]
+    fn next_occurrence_increments_per_amount_date() {
+        let date = NaiveDate::from_ymd_opt(2026, 1, 21).unwrap();
+        let mut counters = HashMap::new();
+        let first = next_occurrence(&mut counters, date, 1000);
+        let second = next_occurrence(&mut counters, date, 1000);
+        let other = next_occurrence(&mut counters, date, 2000);
+        assert_eq!(first, 1);
+        assert_eq!(second, 2);
+        assert_eq!(other, 1);
+    }
+
+    #[test]
+    fn pick_payee_name_prefers_creditor() {
+        let creditor = AccountInformation {
+            holder_name: Some("Creditor".to_string()),
+            iban: None,
+            bic: None,
+        };
+        let debtor = AccountInformation {
+            holder_name: Some("Debtor".to_string()),
+            iban: None,
+            bic: None,
+        };
+        let tx = AccountTransaction {
+            reference: None,
+            booking_status: None,
+            booking_date: None,
+            amount: AmountValue {
+                value: "0".to_string(),
+                unit: None,
+            },
+            creditor: Some(creditor),
+            debtor: Some(debtor),
+            deptor: None,
+            remitter: None,
+            remittance_info: None,
+            transaction_type: None,
+        };
+        assert_eq!(pick_payee_name(&tx), Some("Creditor".to_string()));
     }
 }
