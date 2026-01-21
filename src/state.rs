@@ -48,30 +48,6 @@ impl State {
             .retain(|_, entry| entry.date >= cutoff);
     }
 
-    pub fn assign_occurrence(
-        &mut self,
-        counters: &mut HashMap<String, u32>,
-        reference_key: &str,
-        date: NaiveDate,
-        amount_milli: i64,
-    ) -> u32 {
-        if let Some(entry) = self.reference_occurrences.get(reference_key) {
-            return entry.occurrence;
-        }
-        let counter_key = format!("{}|{}", date, amount_milli);
-        let next = counters.get(&counter_key).copied().unwrap_or(0) + 1;
-        counters.insert(counter_key, next);
-        self.reference_occurrences.insert(
-            reference_key.to_string(),
-            ReferenceEntry {
-                date,
-                amount_milli,
-                occurrence: next,
-            },
-        );
-        next
-    }
-
     pub fn build_counters(&self) -> HashMap<String, u32> {
         let mut counters = HashMap::new();
         for entry in self.reference_occurrences.values() {
