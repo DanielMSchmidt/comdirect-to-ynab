@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use chrono::{DateTime, Duration, NaiveDate, Utc};
+use chrono::{DateTime, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
@@ -42,10 +42,18 @@ impl State {
         Ok(())
     }
 
-    pub fn prune(&mut self, lookback_days: i64) {
-        let cutoff = Utc::now().date_naive() - Duration::days(lookback_days.max(1));
+    pub fn prune_before(&mut self, cutoff: NaiveDate) {
         self.reference_occurrences
             .retain(|_, entry| entry.date >= cutoff);
+    }
+
+    #[cfg(test)]
+    fn entry(date: NaiveDate, amount_milli: i64, occurrence: u32) -> ReferenceEntry {
+        ReferenceEntry {
+            date,
+            amount_milli,
+            occurrence,
+        }
     }
 
     pub fn build_counters(&self) -> HashMap<String, u32> {
@@ -58,5 +66,37 @@ impl State {
             }
         }
         counters
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn date(y: i32, m: u32, d: u32) -> NaiveDate {
+        NaiveDate::from_ymd_opt(y, m, d).unwrap()
+    }
+
+    #[test]
+    fn prune_before_removes_old_entries_and_keeps_recent() {
+        let mut state = State::default();
+        state.reference_occurrences.insert(
+            "old".to_string(),
+            State::entry(date(2026, 3, 1), 1000, 1),
+        );
+        state.reference_occurrences.insert(
+            "on-cutoff".to_string(),
+            State::entry(date(2026, 3, 15), 2000, 1),
+        );
+        state.reference_occurrences.insert(
+            "recent".to_string(),
+            State::entry(date(2026, 4, 1), 3000, 1),
+        );
+
+        state.prune_before(date(2026, 3, 15));
+
+        assert!(!state.reference_occurrences.contains_key("old"));
+        assert!(state.reference_occurrences.contains_key("on-cutoff"));
+        assert!(state.reference_occurrences.contains_key("recent"));
     }
 }

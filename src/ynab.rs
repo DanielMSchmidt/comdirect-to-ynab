@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use chrono::NaiveDate;
 use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, AUTHORIZATION, CONTENT_TYPE};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -60,6 +61,16 @@ struct TransactionPayload {
 pub struct TransactionResponse {
     pub transaction_ids: Option<Vec<String>>,
     pub duplicate_import_ids: Option<Vec<String>>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct YnabAccountTransaction {
+    pub date: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct YnabTransactionList {
+    pub transactions: Vec<YnabAccountTransaction>,
 }
 
 impl YnabClient {
@@ -127,6 +138,37 @@ impl YnabClient {
             .await
             .context("invalid transaction response")?;
         Ok(data.data)
+    }
+
+    pub async fn get_latest_transaction_date(
+        &self,
+        budget_id: &str,
+        account_id: &str,
+    ) -> Result<Option<NaiveDate>> {
+        let url = format!(
+            "{}/budgets/{}/accounts/{}/transactions",
+            API_BASE, budget_id, account_id
+        );
+        let response = self
+            .http
+            .get(url)
+            .headers(self.headers())
+            .send()
+            .await
+            .context("failed to get account transactions")?
+            .error_for_status()
+            .context("account transactions request failed")?;
+        let data: YnabResponse<YnabTransactionList> = response
+            .json()
+            .await
+            .context("invalid transactions response")?;
+        let latest = data
+            .data
+            .transactions
+            .iter()
+            .filter_map(|tx| NaiveDate::parse_from_str(&tx.date, "%Y-%m-%d").ok())
+            .max();
+        Ok(latest)
     }
 
     fn headers(&self) -> HeaderMap {

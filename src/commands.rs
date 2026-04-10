@@ -159,7 +159,29 @@ pub async fn run_auth(paths: &Paths, tan_type: Option<TanType>) -> Result<()> {
 pub async fn run_sync(paths: &Paths) -> Result<()> {
     let config = Config::load(&paths.config)?;
     let mut state = State::load(&paths.state)?;
-    state.prune(config.sync.lookback_days);
+
+    let ynab_token = op::read_secret(&config.ynab.token, &config.op.service_account_token_env)?;
+    let ynab_client = YnabClient::new(ynab_token)?;
+
+    let cutoff = match ynab_client
+        .get_latest_transaction_date(&config.ynab.budget_id, &config.ynab.account_id)
+        .await?
+    {
+        Some(date) => {
+            info!("Latest YNAB transaction date: {}", date);
+            date
+        }
+        None => {
+            let fallback = Utc::now().date_naive() - Duration::days(config.sync.lookback_days);
+            info!(
+                "No YNAB transactions found, falling back to {} days lookback ({})",
+                config.sync.lookback_days, fallback
+            );
+            fallback
+        }
+    };
+
+    state.prune_before(cutoff);
     let mut counters = state.build_counters();
 
     let comdirect = ComdirectClient::new()?;
@@ -191,7 +213,6 @@ pub async fn run_sync(paths: &Paths) -> Result<()> {
     .await?;
     let account = find_account_by_iban(&accounts, &config.comdirect.iban)?;
 
-    let cutoff = Utc::now().date_naive() - Duration::days(config.sync.lookback_days);
     let transactions = fetch_transactions(
         &comdirect,
         &secondary.access_token,
@@ -199,9 +220,6 @@ pub async fn run_sync(paths: &Paths) -> Result<()> {
         cutoff,
     )
     .await?;
-
-    let ynab_token = op::read_secret(&config.ynab.token, &config.op.service_account_token_env)?;
-    let ynab_client = YnabClient::new(ynab_token)?;
 
     let mut pending = Vec::new();
     for tx in transactions {
