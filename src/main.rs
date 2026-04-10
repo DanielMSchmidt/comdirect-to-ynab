@@ -4,8 +4,8 @@ mod commands;
 mod config;
 mod op;
 mod paths;
+mod paypal;
 mod prompt;
-mod state;
 mod ynab;
 
 use anyhow::Result;
@@ -26,5 +26,6 @@ async fn main() -> Result<()> {
         cli::Command::Accounts => commands::run_accounts(&paths).await,
         cli::Command::Auth { tan_type } => commands::run_auth(&paths, tan_type).await,
         cli::Command::Sync => commands::run_sync(&paths).await,
+        cli::Command::Enrich => commands::run_enrich(&paths).await,
     }
 }

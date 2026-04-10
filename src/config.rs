@@ -39,6 +39,7 @@ pub struct OpConfig {
     pub service_account_token_env: String,
 }
 
+
 impl Config {
     pub fn load(path: &Path) -> Result<Self> {
         let contents = fs::read_to_string(path)

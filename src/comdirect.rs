@@ -359,6 +359,7 @@ impl ComdirectClient {
                 "CREDIT_AND_DEBIT".to_string(),
             ),
             ("paging-first".to_string(), paging_first.to_string()),
+            ("paging-count".to_string(), "100".to_string()),
         ];
         let response = self
             .http

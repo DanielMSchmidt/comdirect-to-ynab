@@ -6,17 +6,17 @@ use crate::comdirect::{
 use crate::config::{ComdirectConfig, Config, OpConfig, YnabConfig};
 use crate::op;
 use crate::paths::Paths;
+use crate::paypal;
 use crate::prompt;
-use crate::state::{ReferenceEntry, State};
-use crate::ynab::{AccountSummary, BudgetSummary, Transaction, YnabClient};
+use crate::ynab::{AccountSummary, BudgetSummary, Transaction, TransactionUpdate, YnabClient};
 use anyhow::{bail, Context, Result};
 use chrono::{Duration, NaiveDate, Utc};
 use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
-use std::collections::HashMap;
 use std::fmt;
 use std::str::FromStr;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
+use uuid::Uuid;
 
 pub async fn run_init(paths: &Paths) -> Result<()> {
     std::fs::create_dir_all(&paths.base_dir).with_context(|| {
@@ -158,7 +158,6 @@ pub async fn run_auth(paths: &Paths, tan_type: Option<TanType>) -> Result<()> {
 
 pub async fn run_sync(paths: &Paths) -> Result<()> {
     let config = Config::load(&paths.config)?;
-    let mut state = State::load(&paths.state)?;
 
     let ynab_token = op::read_secret(&config.ynab.token, &config.op.service_account_token_env)?;
     let ynab_client = YnabClient::new(ynab_token)?;
@@ -168,8 +167,12 @@ pub async fn run_sync(paths: &Paths) -> Result<()> {
         .await?
     {
         Some(date) => {
-            info!("Latest YNAB transaction date: {}", date);
-            date
+            let cutoff = date - Duration::days(1);
+            info!(
+                "Latest YNAB transaction: {}. Fetching from {} for overlap.",
+                date, cutoff
+            );
+            cutoff
         }
         None => {
             let fallback = Utc::now().date_naive() - Duration::days(config.sync.lookback_days);
@@ -180,9 +183,6 @@ pub async fn run_sync(paths: &Paths) -> Result<()> {
             fallback
         }
     };
-
-    state.prune_before(cutoff);
-    let mut counters = state.build_counters();
 
     let comdirect = ComdirectClient::new()?;
     let credentials = resolve_comdirect_credentials(&config.comdirect, &config.op)?;
@@ -221,6 +221,14 @@ pub async fn run_sync(paths: &Paths) -> Result<()> {
     )
     .await?;
 
+    info!(
+        "Fetched {} transactions from Comdirect (cutoff: {}).",
+        transactions.len(),
+        cutoff
+    );
+
+    let paypal_lookup = prompt_paypal_csv_if_needed(&transactions, cutoff)?;
+
     let mut pending = Vec::new();
     for tx in transactions {
         let booking_date = match tx.booking_date.as_deref() {
@@ -232,72 +240,211 @@ pub async fn run_sync(paths: &Paths) -> Result<()> {
         };
         let date = NaiveDate::parse_from_str(booking_date, "%Y-%m-%d")
             .with_context(|| format!("invalid booking date {}", booking_date))?;
-        if date < cutoff {
-            continue;
-        }
+        let payee_name = pick_payee_name(&tx);
         let amount_milli = amount_to_milli(&tx.amount.value)?;
-        let reference_key = build_reference_key(&tx, date, amount_milli);
-        let existing = state.reference_occurrences.get(&reference_key).cloned();
-        let occurrence = existing
-            .as_ref()
-            .map(|entry| entry.occurrence)
-            .unwrap_or_else(|| next_occurrence(&mut counters, date, amount_milli));
-        if existing.is_some() {
+        if date < cutoff {
+            debug!(
+                "Skipping (before cutoff): {} {} {}",
+                date,
+                amount_milli,
+                payee_name.as_deref().unwrap_or("?")
+            );
             continue;
         }
 
-        let import_id = format!("YNAB:{}:{}:{}", amount_milli, date, occurrence);
-        let payee_name = pick_payee_name(&tx);
+        let import_id = build_import_id(&tx, date, amount_milli);
+        let payee_name = enrich_payee(&payee_name, amount_milli, date, paypal_lookup.as_ref());
         let memo = build_memo(&tx);
-        pending.push(PendingTransaction {
-            transaction: Transaction {
-                account_id: config.ynab.account_id.clone(),
-                date: date.format("%Y-%m-%d").to_string(),
-                amount: amount_milli,
-                payee_name,
-                memo,
-                import_id,
-                cleared: Some("uncleared".to_string()),
-            },
-            reference_key,
-            reference_entry: ReferenceEntry {
-                date,
-                amount_milli,
-                occurrence,
-            },
+        debug!(
+            "Importing: {} {} {}",
+            date,
+            amount_milli,
+            payee_name.as_deref().unwrap_or("?")
+        );
+        pending.push(Transaction {
+            account_id: config.ynab.account_id.clone(),
+            date: date.format("%Y-%m-%d").to_string(),
+            amount: amount_milli,
+            payee_name,
+            memo,
+            import_id,
+            cleared: Some("uncleared".to_string()),
         });
     }
 
     if pending.is_empty() {
         info!("No new transactions to import.");
-        state.last_synced_at = Some(Utc::now());
-        state.save(&paths.state)?;
         return Ok(());
     }
 
-    info!("Importing {} new transactions.", pending.len());
+    info!("Sending {} transactions to YNAB.", pending.len());
     for chunk in pending.chunks(100) {
-        let transactions: Vec<Transaction> =
-            chunk.iter().map(|item| item.transaction.clone()).collect();
-        ynab_client
-            .create_transactions(&config.ynab.budget_id, &transactions)
+        let response = ynab_client
+            .create_transactions(&config.ynab.budget_id, chunk)
             .await?;
-        for item in chunk {
-            state
-                .reference_occurrences
-                .insert(item.reference_key.clone(), item.reference_entry.clone());
-        }
+        let created = response.transaction_ids.as_ref().map_or(0, |v| v.len());
+        let duplicates = response.duplicate_import_ids.as_ref().map_or(0, |v| v.len());
+        info!(
+            "YNAB: {} created, {} duplicates skipped.",
+            created, duplicates
+        );
     }
 
-    state.last_synced_at = Some(Utc::now());
-    state.save(&paths.state)?;
+    info!("Sync complete.");
     Ok(())
 }
 
-struct PendingTransaction {
-    transaction: Transaction,
-    reference_key: String,
-    reference_entry: ReferenceEntry,
+pub async fn run_enrich(paths: &Paths) -> Result<()> {
+    let config = Config::load(&paths.config)?;
+
+    let ynab_token = op::read_secret(&config.ynab.token, &config.op.service_account_token_env)?;
+    let ynab_client = YnabClient::new(ynab_token)?;
+
+    let transactions = ynab_client
+        .list_account_transactions(
+            &config.ynab.budget_id,
+            &config.ynab.account_id,
+            Some("unapproved"),
+        )
+        .await?;
+
+    let paypal_transactions: Vec<_> = transactions
+        .iter()
+        .filter(|tx| is_paypal_payee(&tx.payee_name))
+        .collect();
+
+    if paypal_transactions.is_empty() {
+        info!("No unapproved PayPal transactions to enrich.");
+        return Ok(());
+    }
+
+    let min_date = paypal_transactions
+        .iter()
+        .filter_map(|tx| NaiveDate::parse_from_str(&tx.date, "%Y-%m-%d").ok())
+        .min()
+        .context("no valid dates in PayPal transactions")?;
+    let max_date = paypal_transactions
+        .iter()
+        .filter_map(|tx| NaiveDate::parse_from_str(&tx.date, "%Y-%m-%d").ok())
+        .max()
+        .unwrap_or(min_date);
+
+    println!(
+        "Found {} unapproved PayPal transactions ({} to {}).",
+        paypal_transactions.len(),
+        min_date,
+        max_date
+    );
+    let lookup = prompt_paypal_csv(min_date, max_date)?;
+
+    let mut updates = Vec::new();
+    for tx in &paypal_transactions {
+        let date = match NaiveDate::parse_from_str(&tx.date, "%Y-%m-%d").ok() {
+            Some(d) => d,
+            None => continue,
+        };
+        if let Some(merchant) = paypal::match_transaction(&lookup, tx.amount, date) {
+            info!("Enriching: {} -> {}", tx.id, merchant);
+            updates.push(TransactionUpdate {
+                id: tx.id.clone(),
+                payee_name: Some(merchant),
+            });
+        } else {
+            debug!("No PayPal match for transaction {} on {}", tx.id, tx.date);
+        }
+    }
+
+    if updates.is_empty() {
+        info!("No PayPal matches found for enrichment.");
+        return Ok(());
+    }
+
+    info!(
+        "Updating {} transactions with real payee names.",
+        updates.len()
+    );
+    ynab_client
+        .update_transactions(&config.ynab.budget_id, &updates)
+        .await?;
+    info!("Enrichment complete.");
+    Ok(())
+}
+
+// -- PayPal enrichment helpers --
+
+fn is_paypal_payee(payee: &Option<String>) -> bool {
+    payee
+        .as_deref()
+        .map(|name| name.to_lowercase().contains("paypal"))
+        .unwrap_or(false)
+}
+
+fn prompt_paypal_csv(
+    min_date: NaiveDate,
+    max_date: NaiveDate,
+) -> Result<paypal::PaypalLookup> {
+    println!("To enrich PayPal transactions, download your activity as CSV:");
+    println!(
+        "  1. Go to {}",
+        paypal::DOWNLOAD_URL
+    );
+    println!(
+        "  2. Select date range: {} to {}",
+        min_date.format("%d.%m.%Y"),
+        max_date.format("%d.%m.%Y")
+    );
+    println!("  3. Download as CSV");
+    let path_str = prompt_required("Path to PayPal CSV file")?;
+    let path = std::path::Path::new(path_str.trim());
+    let transactions = paypal::parse_csv(path)?;
+    info!("Parsed {} transactions from PayPal CSV.", transactions.len());
+    Ok(paypal::build_lookup(&transactions))
+}
+
+fn prompt_paypal_csv_if_needed(
+    transactions: &[AccountTransaction],
+    cutoff: NaiveDate,
+) -> Result<Option<paypal::PaypalLookup>> {
+    let paypal_count = transactions
+        .iter()
+        .filter(|tx| {
+            tx.booking_date
+                .as_deref()
+                .and_then(|d| NaiveDate::parse_from_str(d, "%Y-%m-%d").ok())
+                .map_or(false, |d| d >= cutoff)
+                && is_paypal_payee(&pick_payee_name(tx))
+        })
+        .count();
+
+    if paypal_count == 0 {
+        return Ok(None);
+    }
+
+    println!("Found {} PayPal transactions.", paypal_count);
+    let enrich = prompt::prompt_default("Enrich with real payee names? (y/N)", "N")?;
+    if !enrich.to_lowercase().starts_with('y') {
+        return Ok(None);
+    }
+
+    let today = Utc::now().date_naive();
+    let lookup = prompt_paypal_csv(cutoff, today)?;
+    Ok(Some(lookup))
+}
+
+fn enrich_payee(
+    current: &Option<String>,
+    amount_milli: i64,
+    date: NaiveDate,
+    lookup: Option<&paypal::PaypalLookup>,
+) -> Option<String> {
+    if let Some(lookup) = lookup {
+        if is_paypal_payee(current) {
+            if let Some(merchant) = paypal::match_transaction(lookup, amount_milli, date) {
+                return Some(merchant);
+            }
+        }
+    }
+    current.clone()
 }
 
 fn resolve_comdirect_credentials(
@@ -373,11 +520,16 @@ async fn fetch_transactions(
             .list_transactions(access_token, account_id, paging_first)
             .await?;
         if page.values.is_empty() {
+            debug!("Empty page at offset {}, stopping.", paging_first);
             break;
         }
         let mut reached_cutoff = false;
         let values = page.values;
         let values_len = values.len();
+        debug!(
+            "Page at offset {}: {} transactions.",
+            paging_first, values_len
+        );
         for tx in values {
             if let Some(date) = tx
                 .booking_date
@@ -391,12 +543,20 @@ async fn fetch_transactions(
             all.push(tx);
         }
         if reached_cutoff {
+            debug!(
+                "Reached cutoff {} at offset {}, stopping.",
+                cutoff, paging_first
+            );
             break;
         }
         paging_first += values_len as i32;
         if let Some(paging) = page.paging {
             if let Some(total) = paging.matches {
                 if paging_first >= total {
+                    debug!(
+                        "Reached total {} at offset {}, stopping.",
+                        total, paging_first
+                    );
                     break;
                 }
             }
@@ -440,11 +600,19 @@ fn amount_to_milli(value: &str) -> Result<i64> {
         .context("failed to convert amount to milliunits")
 }
 
-fn next_occurrence(counters: &mut HashMap<String, u32>, date: NaiveDate, amount_milli: i64) -> u32 {
-    let key = format!("{}|{}", date, amount_milli);
-    let next = counters.get(&key).copied().unwrap_or(0) + 1;
-    counters.insert(key, next);
-    next
+/// Build a deterministic import_id from the transaction's content.
+/// Uses UUID v5 (SHA-1 based) so the same transaction always produces the same ID,
+/// but different transactions produce different IDs regardless of ordering.
+/// YNAB limits import_id to 36 chars - a UUID is exactly 36 chars with hyphens.
+fn build_import_id(tx: &AccountTransaction, date: NaiveDate, amount_milli: i64) -> String {
+    const NAMESPACE: Uuid = Uuid::from_bytes([
+        0x6b, 0xa7, 0xb8, 0x10, 0x9d, 0xad, 0x11, 0xd1, 0x80, 0xb4, 0x00, 0xc0, 0x4f, 0xd4,
+        0x30, 0xc8,
+    ]);
+    let reference = tx.reference.as_deref().unwrap_or("");
+    let remittance = tx.remittance_info.as_deref().unwrap_or("");
+    let input = format!("{}|{}|{}|{}", date, amount_milli, reference, remittance);
+    Uuid::new_v5(&NAMESPACE, input.as_bytes()).to_string()
 }
 
 fn pick_payee_name(tx: &AccountTransaction) -> Option<String> {
@@ -452,20 +620,6 @@ fn pick_payee_name(tx: &AccountTransaction) -> Option<String> {
         .or_else(|| extract_holder_name(&tx.debtor))
         .or_else(|| extract_holder_name(&tx.deptor))
         .or_else(|| extract_holder_name(&tx.remitter))
-}
-
-fn build_reference_key(tx: &AccountTransaction, date: NaiveDate, amount_milli: i64) -> String {
-    if let Some(reference) = tx.reference.as_deref() {
-        if !reference.trim().is_empty() {
-            return reference.trim().to_string();
-        }
-    }
-    let memo = tx
-        .remittance_info
-        .as_deref()
-        .unwrap_or("")
-        .replace(['\n', '\r'], " ");
-    format!("{}|{}|{}", date, amount_milli, memo)
 }
 
 fn build_memo(tx: &AccountTransaction) -> Option<String> {
@@ -602,22 +756,6 @@ mod tests {
     }
 
     #[test]
-    fn build_reference_key_prefers_reference() {
-        let tx = sample_transaction(Some(" ref-123 "), None, None);
-        let date = NaiveDate::from_ymd_opt(2026, 1, 21).unwrap();
-        let key = build_reference_key(&tx, date, 1000);
-        assert_eq!(key, "ref-123");
-    }
-
-    #[test]
-    fn build_reference_key_uses_memo_when_missing_reference() {
-        let tx = sample_transaction(None, Some("hello\nworld"), None);
-        let date = NaiveDate::from_ymd_opt(2026, 1, 21).unwrap();
-        let key = build_reference_key(&tx, date, 1000);
-        assert_eq!(key, "2026-01-21|1000|hello world");
-    }
-
-    #[test]
     fn build_memo_combines_remittance_and_type() {
         let tx = sample_transaction(None, Some("Rent"), Some("Transfer"));
         let memo = build_memo(&tx).unwrap();
@@ -632,15 +770,73 @@ mod tests {
     }
 
     #[test]
-    fn next_occurrence_increments_per_amount_date() {
-        let date = NaiveDate::from_ymd_opt(2026, 1, 21).unwrap();
-        let mut counters = HashMap::new();
-        let first = next_occurrence(&mut counters, date, 1000);
-        let second = next_occurrence(&mut counters, date, 1000);
-        let other = next_occurrence(&mut counters, date, 2000);
-        assert_eq!(first, 1);
-        assert_eq!(second, 2);
-        assert_eq!(other, 1);
+    fn build_import_id_is_deterministic() {
+        let tx = sample_transaction(Some("ref-1"), Some("payment"), None);
+        let date = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap();
+        let id1 = build_import_id(&tx, date, -25500);
+        let id2 = build_import_id(&tx, date, -25500);
+        assert_eq!(id1, id2);
+        assert_eq!(id1.len(), 36); // UUID format fits YNAB's 36 char limit
+    }
+
+    #[test]
+    fn build_import_id_differs_for_different_transactions() {
+        let date = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap();
+        let tx1 = sample_transaction(Some("ref-1"), Some("payment A"), None);
+        let tx2 = sample_transaction(Some("ref-2"), Some("payment B"), None);
+        let id1 = build_import_id(&tx1, date, -25500);
+        let id2 = build_import_id(&tx2, date, -25500);
+        assert_ne!(id1, id2);
+    }
+
+    #[test]
+    fn build_import_id_differs_for_same_amount_date_different_reference() {
+        let date = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap();
+        let tx1 = sample_transaction(Some("ref-A"), None, None);
+        let tx2 = sample_transaction(Some("ref-B"), None, None);
+        let id1 = build_import_id(&tx1, date, -37000);
+        let id2 = build_import_id(&tx2, date, -37000);
+        assert_ne!(id1, id2);
+    }
+
+    #[test]
+    fn is_paypal_payee_detects_paypal_names() {
+        assert!(is_paypal_payee(&Some(
+            "PayPal (Europe) S.a.r.l. et Cie, S.C.A.".to_string()
+        )));
+        assert!(is_paypal_payee(&Some("PAYPAL".to_string())));
+        assert!(is_paypal_payee(&Some("paypal".to_string())));
+        assert!(!is_paypal_payee(&Some("Amazon".to_string())));
+        assert!(!is_paypal_payee(&None));
+    }
+
+    #[test]
+    fn enrich_payee_replaces_paypal_when_match_found() {
+        let date = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap();
+        let mut lookup = paypal::PaypalLookup::new();
+        lookup.insert((-9990, date), vec!["Netflix".to_string()]);
+
+        let payee = Some("PayPal (Europe) S.a.r.l.".to_string());
+        let result = enrich_payee(&payee, -9990, date, Some(&lookup));
+        assert_eq!(result, Some("Netflix".to_string()));
+    }
+
+    #[test]
+    fn enrich_payee_keeps_original_for_non_paypal() {
+        let date = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap();
+        let lookup = paypal::PaypalLookup::new();
+
+        let payee = Some("Amazon".to_string());
+        let result = enrich_payee(&payee, -9990, date, Some(&lookup));
+        assert_eq!(result, Some("Amazon".to_string()));
+    }
+
+    #[test]
+    fn enrich_payee_keeps_paypal_when_no_lookup() {
+        let date = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap();
+        let payee = Some("PayPal".to_string());
+        let result = enrich_payee(&payee, -9990, date, None);
+        assert_eq!(result, Some("PayPal".to_string()));
     }
 
     #[test]

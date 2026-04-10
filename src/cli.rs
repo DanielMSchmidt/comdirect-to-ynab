@@ -19,6 +19,7 @@ pub enum Command {
         tan_type: Option<TanType>,
     },
     Sync,
+    Enrich,
 }
 
 #[derive(Clone, Debug, ValueEnum)]

@@ -5,7 +5,6 @@ use std::path::PathBuf;
 #[derive(Debug, Clone)]
 pub struct Paths {
     pub config: PathBuf,
-    pub state: PathBuf,
     pub base_dir: PathBuf,
 }
 
@@ -17,10 +16,8 @@ impl Paths {
             .parent()
             .context("config path has no parent directory")?
             .to_path_buf();
-        let state_path = base_dir.join("state.json");
         Ok(Self {
             config: config_path,
-            state: state_path,
             base_dir,
         })
     }
