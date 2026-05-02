@@ -19,7 +19,11 @@ pub enum Command {
         tan_type: Option<TanType>,
     },
     Sync,
-    Enrich,
+    Enrich {
+        /// Number of days to look back for PayPal transactions (default: 120)
+        #[arg(long, default_value = "120")]
+        days: i64,
+    },
 }
 
 #[derive(Clone, Debug, ValueEnum)]

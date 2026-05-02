@@ -294,17 +294,21 @@ pub async fn run_sync(paths: &Paths) -> Result<()> {
     Ok(())
 }
 
-pub async fn run_enrich(paths: &Paths) -> Result<()> {
+pub async fn run_enrich(paths: &Paths, days: i64) -> Result<()> {
     let config = Config::load(&paths.config)?;
 
     let ynab_token = op::read_secret(&config.ynab.token, &config.op.service_account_token_env)?;
     let ynab_client = YnabClient::new(ynab_token)?;
 
+    let since = Utc::now().date_naive() - Duration::days(days);
+    info!("Looking for PayPal transactions since {} ({} days).", since, days);
+
     let transactions = ynab_client
         .list_account_transactions(
             &config.ynab.budget_id,
             &config.ynab.account_id,
-            Some("unapproved"),
+            None,
+            Some(&since.format("%Y-%m-%d").to_string()),
         )
         .await?;
 
@@ -314,7 +318,7 @@ pub async fn run_enrich(paths: &Paths) -> Result<()> {
         .collect();
 
     if paypal_transactions.is_empty() {
-        info!("No unapproved PayPal transactions to enrich.");
+        info!("No PayPal transactions found in the last {} days.", days);
         return Ok(());
     }
 
@@ -330,7 +334,7 @@ pub async fn run_enrich(paths: &Paths) -> Result<()> {
         .unwrap_or(min_date);
 
     println!(
-        "Found {} unapproved PayPal transactions ({} to {}).",
+        "Found {} PayPal transactions ({} to {}).",
         paypal_transactions.len(),
         min_date,
         max_date

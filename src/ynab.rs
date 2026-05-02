@@ -163,13 +163,21 @@ impl YnabClient {
         budget_id: &str,
         account_id: &str,
         transaction_type: Option<&str>,
+        since_date: Option<&str>,
     ) -> Result<Vec<YnabAccountTransaction>> {
+        let mut params = Vec::new();
+        if let Some(tx_type) = transaction_type {
+            params.push(format!("type={}", tx_type));
+        }
+        if let Some(date) = since_date {
+            params.push(format!("since_date={}", date));
+        }
         let mut url = format!(
             "{}/budgets/{}/accounts/{}/transactions",
             API_BASE, budget_id, account_id
         );
-        if let Some(tx_type) = transaction_type {
-            url = format!("{}?type={}", url, tx_type);
+        if !params.is_empty() {
+            url = format!("{}?{}", url, params.join("&"));
         }
         let response = self
             .http
