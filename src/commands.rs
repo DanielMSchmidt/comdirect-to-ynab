@@ -6,9 +6,8 @@ use crate::comdirect::{
 use crate::config::{ComdirectConfig, Config, OpConfig, YnabConfig};
 use crate::op;
 use crate::paths::Paths;
-use crate::paypal;
 use crate::prompt;
-use crate::ynab::{AccountSummary, BudgetSummary, Transaction, TransactionUpdate, YnabClient};
+use crate::ynab::{AccountSummary, BudgetSummary, Transaction, YnabClient};
 use anyhow::{bail, Context, Result};
 use chrono::{Duration, NaiveDate, Utc};
 use rust_decimal::prelude::ToPrimitive;
@@ -67,7 +66,7 @@ pub async fn run_init(paths: &Paths) -> Result<()> {
             budget_id: budget.id,
             account_id: account.id,
         },
-        sync: crate::config::SyncConfig { lookback_days: 30 },
+        sync: crate::config::SyncConfig { lookback_days: 120 },
         op: op_config,
     };
 
@@ -162,25 +161,26 @@ pub async fn run_sync(paths: &Paths) -> Result<()> {
     let ynab_token = op::read_secret(&config.ynab.token, &config.op.service_account_token_env)?;
     let ynab_client = YnabClient::new(ynab_token)?;
 
+    let floor = Utc::now().date_naive() - Duration::days(config.sync.lookback_days);
     let cutoff = match ynab_client
         .get_latest_transaction_date(&config.ynab.budget_id, &config.ynab.account_id)
         .await?
     {
         Some(date) => {
-            let cutoff = date - Duration::days(1);
+            let overlap = date - Duration::days(1);
+            let cutoff = overlap.min(floor);
             info!(
-                "Latest YNAB transaction: {}. Fetching from {} for overlap.",
-                date, cutoff
+                "Latest YNAB transaction: {}. Fetching from {} ({}-day floor).",
+                date, cutoff, config.sync.lookback_days
             );
             cutoff
         }
         None => {
-            let fallback = Utc::now().date_naive() - Duration::days(config.sync.lookback_days);
             info!(
                 "No YNAB transactions found, falling back to {} days lookback ({})",
-                config.sync.lookback_days, fallback
+                config.sync.lookback_days, floor
             );
-            fallback
+            floor
         }
     };
 
@@ -227,8 +227,6 @@ pub async fn run_sync(paths: &Paths) -> Result<()> {
         cutoff
     );
 
-    let paypal_lookup = prompt_paypal_csv_if_needed(&transactions, cutoff)?;
-
     let mut pending = Vec::new();
     for tx in transactions {
         let booking_date = match tx.booking_date.as_deref() {
@@ -253,7 +251,6 @@ pub async fn run_sync(paths: &Paths) -> Result<()> {
         }
 
         let import_id = build_import_id(&tx, date, amount_milli);
-        let payee_name = enrich_payee(&payee_name, amount_milli, date, paypal_lookup.as_ref());
         let memo = build_memo(&tx);
         debug!(
             "Importing: {} {} {}",
@@ -292,163 +289,6 @@ pub async fn run_sync(paths: &Paths) -> Result<()> {
 
     info!("Sync complete.");
     Ok(())
-}
-
-pub async fn run_enrich(paths: &Paths, days: i64) -> Result<()> {
-    let config = Config::load(&paths.config)?;
-
-    let ynab_token = op::read_secret(&config.ynab.token, &config.op.service_account_token_env)?;
-    let ynab_client = YnabClient::new(ynab_token)?;
-
-    let since = Utc::now().date_naive() - Duration::days(days);
-    info!("Looking for PayPal transactions since {} ({} days).", since, days);
-
-    let transactions = ynab_client
-        .list_account_transactions(
-            &config.ynab.budget_id,
-            &config.ynab.account_id,
-            None,
-            Some(&since.format("%Y-%m-%d").to_string()),
-        )
-        .await?;
-
-    let paypal_transactions: Vec<_> = transactions
-        .iter()
-        .filter(|tx| is_paypal_payee(&tx.payee_name))
-        .collect();
-
-    if paypal_transactions.is_empty() {
-        info!("No PayPal transactions found in the last {} days.", days);
-        return Ok(());
-    }
-
-    let min_date = paypal_transactions
-        .iter()
-        .filter_map(|tx| NaiveDate::parse_from_str(&tx.date, "%Y-%m-%d").ok())
-        .min()
-        .context("no valid dates in PayPal transactions")?;
-    let max_date = paypal_transactions
-        .iter()
-        .filter_map(|tx| NaiveDate::parse_from_str(&tx.date, "%Y-%m-%d").ok())
-        .max()
-        .unwrap_or(min_date);
-
-    println!(
-        "Found {} PayPal transactions ({} to {}).",
-        paypal_transactions.len(),
-        min_date,
-        max_date
-    );
-    let lookup = prompt_paypal_csv(min_date, max_date)?;
-
-    let mut updates = Vec::new();
-    for tx in &paypal_transactions {
-        let date = match NaiveDate::parse_from_str(&tx.date, "%Y-%m-%d").ok() {
-            Some(d) => d,
-            None => continue,
-        };
-        if let Some(merchant) = paypal::match_transaction(&lookup, tx.amount, date) {
-            info!("Enriching: {} -> {}", tx.id, merchant);
-            updates.push(TransactionUpdate {
-                id: tx.id.clone(),
-                payee_name: Some(merchant),
-            });
-        } else {
-            debug!("No PayPal match for transaction {} on {}", tx.id, tx.date);
-        }
-    }
-
-    if updates.is_empty() {
-        info!("No PayPal matches found for enrichment.");
-        return Ok(());
-    }
-
-    info!(
-        "Updating {} transactions with real payee names.",
-        updates.len()
-    );
-    ynab_client
-        .update_transactions(&config.ynab.budget_id, &updates)
-        .await?;
-    info!("Enrichment complete.");
-    Ok(())
-}
-
-// -- PayPal enrichment helpers --
-
-fn is_paypal_payee(payee: &Option<String>) -> bool {
-    payee
-        .as_deref()
-        .map(|name| name.to_lowercase().contains("paypal"))
-        .unwrap_or(false)
-}
-
-fn prompt_paypal_csv(
-    min_date: NaiveDate,
-    max_date: NaiveDate,
-) -> Result<paypal::PaypalLookup> {
-    println!("To enrich PayPal transactions, download your activity as CSV:");
-    println!(
-        "  1. Go to {}",
-        paypal::DOWNLOAD_URL
-    );
-    println!(
-        "  2. Select date range: {} to {}",
-        min_date.format("%d.%m.%Y"),
-        max_date.format("%d.%m.%Y")
-    );
-    println!("  3. Download as CSV");
-    let path_str = prompt_required("Path to PayPal CSV file")?;
-    let path = std::path::Path::new(path_str.trim());
-    let transactions = paypal::parse_csv(path)?;
-    info!("Parsed {} transactions from PayPal CSV.", transactions.len());
-    Ok(paypal::build_lookup(&transactions))
-}
-
-fn prompt_paypal_csv_if_needed(
-    transactions: &[AccountTransaction],
-    cutoff: NaiveDate,
-) -> Result<Option<paypal::PaypalLookup>> {
-    let paypal_count = transactions
-        .iter()
-        .filter(|tx| {
-            tx.booking_date
-                .as_deref()
-                .and_then(|d| NaiveDate::parse_from_str(d, "%Y-%m-%d").ok())
-                .map_or(false, |d| d >= cutoff)
-                && is_paypal_payee(&pick_payee_name(tx))
-        })
-        .count();
-
-    if paypal_count == 0 {
-        return Ok(None);
-    }
-
-    println!("Found {} PayPal transactions.", paypal_count);
-    let enrich = prompt::prompt_default("Enrich with real payee names? (y/N)", "N")?;
-    if !enrich.to_lowercase().starts_with('y') {
-        return Ok(None);
-    }
-
-    let today = Utc::now().date_naive();
-    let lookup = prompt_paypal_csv(cutoff, today)?;
-    Ok(Some(lookup))
-}
-
-fn enrich_payee(
-    current: &Option<String>,
-    amount_milli: i64,
-    date: NaiveDate,
-    lookup: Option<&paypal::PaypalLookup>,
-) -> Option<String> {
-    if let Some(lookup) = lookup {
-        if is_paypal_payee(current) {
-            if let Some(merchant) = paypal::match_transaction(lookup, amount_milli, date) {
-                return Some(merchant);
-            }
-        }
-    }
-    current.clone()
 }
 
 fn resolve_comdirect_credentials(
@@ -801,46 +641,6 @@ mod tests {
         let id1 = build_import_id(&tx1, date, -37000);
         let id2 = build_import_id(&tx2, date, -37000);
         assert_ne!(id1, id2);
-    }
-
-    #[test]
-    fn is_paypal_payee_detects_paypal_names() {
-        assert!(is_paypal_payee(&Some(
-            "PayPal (Europe) S.a.r.l. et Cie, S.C.A.".to_string()
-        )));
-        assert!(is_paypal_payee(&Some("PAYPAL".to_string())));
-        assert!(is_paypal_payee(&Some("paypal".to_string())));
-        assert!(!is_paypal_payee(&Some("Amazon".to_string())));
-        assert!(!is_paypal_payee(&None));
-    }
-
-    #[test]
-    fn enrich_payee_replaces_paypal_when_match_found() {
-        let date = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap();
-        let mut lookup = paypal::PaypalLookup::new();
-        lookup.insert((-9990, date), vec!["Netflix".to_string()]);
-
-        let payee = Some("PayPal (Europe) S.a.r.l.".to_string());
-        let result = enrich_payee(&payee, -9990, date, Some(&lookup));
-        assert_eq!(result, Some("Netflix".to_string()));
-    }
-
-    #[test]
-    fn enrich_payee_keeps_original_for_non_paypal() {
-        let date = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap();
-        let lookup = paypal::PaypalLookup::new();
-
-        let payee = Some("Amazon".to_string());
-        let result = enrich_payee(&payee, -9990, date, Some(&lookup));
-        assert_eq!(result, Some("Amazon".to_string()));
-    }
-
-    #[test]
-    fn enrich_payee_keeps_paypal_when_no_lookup() {
-        let date = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap();
-        let payee = Some("PayPal".to_string());
-        let result = enrich_payee(&payee, -9990, date, None);
-        assert_eq!(result, Some("PayPal".to_string()));
     }
 
     #[test]

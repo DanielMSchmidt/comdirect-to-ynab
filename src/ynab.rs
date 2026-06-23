@@ -64,31 +64,13 @@ pub struct TransactionResponse {
 }
 
 #[derive(Debug, Deserialize, Clone)]
-#[allow(dead_code)]
 pub struct YnabAccountTransaction {
-    pub id: String,
     pub date: String,
-    pub amount: i64,
-    pub payee_name: Option<String>,
-    pub approved: Option<bool>,
-    pub memo: Option<String>,
-    pub import_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct YnabTransactionList {
     pub transactions: Vec<YnabAccountTransaction>,
-}
-
-#[derive(Debug, Serialize, Clone)]
-pub struct TransactionUpdate {
-    pub id: String,
-    pub payee_name: Option<String>,
-}
-
-#[derive(Debug, Serialize)]
-struct TransactionUpdatePayload {
-    pub transactions: Vec<TransactionUpdate>,
 }
 
 impl YnabClient {
@@ -156,64 +138,6 @@ impl YnabClient {
             .await
             .context("invalid transaction response")?;
         Ok(data.data)
-    }
-
-    pub async fn list_account_transactions(
-        &self,
-        budget_id: &str,
-        account_id: &str,
-        transaction_type: Option<&str>,
-        since_date: Option<&str>,
-    ) -> Result<Vec<YnabAccountTransaction>> {
-        let mut params = Vec::new();
-        if let Some(tx_type) = transaction_type {
-            params.push(format!("type={}", tx_type));
-        }
-        if let Some(date) = since_date {
-            params.push(format!("since_date={}", date));
-        }
-        let mut url = format!(
-            "{}/budgets/{}/accounts/{}/transactions",
-            API_BASE, budget_id, account_id
-        );
-        if !params.is_empty() {
-            url = format!("{}?{}", url, params.join("&"));
-        }
-        let response = self
-            .http
-            .get(&url)
-            .headers(self.headers())
-            .send()
-            .await
-            .context("failed to list account transactions")?
-            .error_for_status()
-            .context("account transactions request failed")?;
-        let data: YnabResponse<YnabTransactionList> = response
-            .json()
-            .await
-            .context("invalid transactions response")?;
-        Ok(data.data.transactions)
-    }
-
-    pub async fn update_transactions(
-        &self,
-        budget_id: &str,
-        updates: &[TransactionUpdate],
-    ) -> Result<()> {
-        let url = format!("{}/budgets/{}/transactions", API_BASE, budget_id);
-        let payload = TransactionUpdatePayload {
-            transactions: updates.to_vec(),
-        };
-        self.http
-            .patch(&url)
-            .headers(self.headers())
-            .json(&payload)
-            .send()
-            .await
-            .context("failed to update transactions")?
-            .error_for_status()
-            .context("transaction update request failed")?;
-        Ok(())
     }
 
     pub async fn get_latest_transaction_date(
